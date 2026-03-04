@@ -331,8 +331,13 @@ impl ActiveRelayActor {
                 }
                 RelayConnectionError::Established { .. } => {
                     // If the relay connection remained established long enough so that we received a pong
-                    // from the relay server, we reset the backoff and attempt to reconnect immediately.
+                    // from the relay server, we reset the backoff but add a small delay before
+                    // reconnecting. This prevents cascade reconnections where rapid network
+                    // change events (common on macOS) kill connections via CheckConnection,
+                    // and immediate reconnection causes the relay server to evict the
+                    // still-closing old connection, triggering another reconnect.
                     backoff = Self::build_backoff();
+                    time::sleep(Duration::from_secs(2)).await;
                 }
             }
         }
@@ -564,15 +569,28 @@ impl ActiveRelayActor {
                             self.set_home_relay(is_home);
                         }
                         ActiveRelayMessage::CheckConnection(local_ips) => {
+                            // Always send a ping to verify the connection is alive,
+                            // regardless of whether the local IP is still in the
+                            // interface list. On macOS, IPs can transiently disappear
+                            // from the interface list during network change events
+                            // while the TCP connection remains perfectly functional.
+                            // If the connection is truly dead, the ping will timeout
+                            // (5s) and the connection will be properly terminated.
                             match client_stream.local_addr() {
-                                Some(addr) if local_ips.contains(&addr.ip()) => {
-                                    let data = state.ping_tracker.new_ping();
-                                    let fut = client_sink.send(ClientToRelayMsg::Ping(data));
-                                    self.run_sending(fut, &mut state, &mut client_stream).await?;
+                                Some(addr) if !local_ips.contains(&addr.ip()) => {
+                                    warn!(
+                                        local_ip = %addr.ip(),
+                                        "Local IP not in interface list, pinging to verify connection"
+                                    );
                                 }
-                                Some(_) => break Err(e!(RunError::LocalIpInvalid)),
-                                None => break Err(e!(RunError::LocalAddrMissing)),
+                                None => {
+                                    warn!("No local address on relay connection, pinging to verify");
+                                }
+                                _ => {}
                             }
+                            let data = state.ping_tracker.new_ping();
+                            let fut = client_sink.send(ClientToRelayMsg::Ping(data));
+                            self.run_sending(fut, &mut state, &mut client_stream).await?;
                         }
                         #[cfg(test)]
                         ActiveRelayMessage::GetLocalAddr(sender) => {
@@ -815,6 +833,12 @@ pub(crate) struct RelaySendItem {
     pub(crate) datagrams: Datagrams,
 }
 
+/// Minimum interval between processing `MaybeCloseRelaysOnRebind` events.
+/// On macOS, AF_ROUTE events can fire rapidly during network transitions.
+/// Without this cooldown, each event triggers a fresh CheckConnection to all
+/// active relays, which can cascade into connection churn.
+const REBIND_COOLDOWN: Duration = Duration::from_secs(5);
+
 pub(super) struct RelayActor {
     config: Config,
     /// Queue on which to put received datagrams.
@@ -827,6 +851,9 @@ pub(super) struct RelayActor {
     /// The tasks for the [`ActiveRelayActor`]s in `active_relays` above.
     active_relay_tasks: JoinSet<()>,
     cancel_token: CancellationToken,
+    /// Tracks when we last processed a rebind check, to prevent rapid-fire
+    /// CheckConnection events from network change storms.
+    last_rebind_check: Option<time::Instant>,
 }
 
 #[derive(Debug, Clone)]
@@ -856,6 +883,7 @@ impl RelayActor {
             active_relays: Default::default(),
             active_relay_tasks: JoinSet::new(),
             cancel_token,
+            last_rebind_check: None,
         }
     }
 
@@ -1115,12 +1143,24 @@ impl RelayActor {
         handle
     }
 
-    /// Closes the relay connections not originating from a local IP address.
+    /// Checks relay connections after a network rebind event.
     ///
-    /// Called in response to a rebind, any relay connection originating from an address
-    /// that's not known to be currently a local IP address should be closed.  All the other
-    /// relay connections are pinged.
+    /// Called in response to a rebind. Sends a ping to all active relay connections to
+    /// verify they are still alive. Connections where the ping times out will be
+    /// cleaned up by the normal ping timeout mechanism.
+    ///
+    /// Rate-limited by [`REBIND_COOLDOWN`] to prevent rapid-fire checks from
+    /// network change event storms (common on macOS).
     async fn maybe_close_relays_on_rebind(&mut self) {
+        // Rate-limit rebind checks to prevent cascade from rapid network events.
+        let now = time::Instant::now();
+        if let Some(last) = self.last_rebind_check {
+            if now.duration_since(last) < REBIND_COOLDOWN {
+                debug!("Skipping rebind check, last check was {:?} ago", now.duration_since(last));
+                return;
+            }
+        }
+        self.last_rebind_check = Some(now);
         #[cfg(not(wasm_browser))]
         let ifs = interfaces::State::new().await;
         #[cfg(not(wasm_browser))]
