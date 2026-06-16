@@ -501,6 +501,23 @@ impl ConcurrentAddressLookup {
         *self.addr_filter.write().expect("poisoned") = Some(filter);
     }
 
+    /// Apply the configured address filter to a set of addresses, returning the
+    /// kept addresses (identity if no filter is set).
+    ///
+    /// This lets other layers reuse the *same* filter configured for discovery
+    /// publishing — in particular the socket's direct-address set used for in-band
+    /// NAT-traversal candidates — so a filtered range is excluded consistently
+    /// across both channels, not only from published addresses.
+    pub fn apply_filter(
+        &self,
+        addrs: &std::collections::BTreeSet<iroh_base::TransportAddr>,
+    ) -> Vec<iroh_base::TransportAddr> {
+        match &*self.addr_filter.read().expect("poisoned") {
+            Some(filter) => filter.apply(addrs),
+            None => addrs.iter().cloned().collect(),
+        }
+    }
+
     /// Adds an [`AddressLookup`] service.
     ///
     /// If there is historical Address Lookup data, it will be published immediately on this service.

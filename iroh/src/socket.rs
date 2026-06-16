@@ -436,10 +436,38 @@ impl Socket {
     /// If the direct addresses have changed from the previous set, they are published to
     /// the address lookup system.
     fn store_direct_addresses(&self, addrs: BTreeSet<DirectAddr>) {
+        // Apply the SAME address filter configured for discovery publishing to the
+        // direct-address set, so a filtered range (e.g. a CGNAT/VPN overlay that is
+        // only reachable *through* a tunnel) is excluded from in-band NAT-traversal
+        // candidates too — not only from published addresses. Without this, peers
+        // still exchange and try to hole-punch to filtered addresses over the
+        // connection. Identity (no-op) when no filter is configured.
+        let addrs = self.filter_direct_addrs(addrs);
         let updated = self.direct_addrs.update(addrs);
         if updated {
             self.publish_my_addr();
         }
+    }
+
+    /// Drop direct addresses rejected by the configured address filter (identity
+    /// if none). The filter operates on [`TransportAddr`]; map each [`DirectAddr`]
+    /// to its IP transport address, filter, and keep the survivors by socket addr.
+    fn filter_direct_addrs(&self, addrs: BTreeSet<DirectAddr>) -> BTreeSet<DirectAddr> {
+        let as_transport: BTreeSet<TransportAddr> =
+            addrs.iter().map(|d| TransportAddr::Ip(d.addr)).collect();
+        let kept: BTreeSet<SocketAddr> = self
+            .address_lookup
+            .apply_filter(&as_transport)
+            .into_iter()
+            .filter_map(|t| match t {
+                TransportAddr::Ip(sa) => Some(sa),
+                _ => None,
+            })
+            .collect();
+        addrs
+            .into_iter()
+            .filter(|d| kept.contains(&d.addr))
+            .collect()
     }
 
     /// Get a reference to the DNS resolver used in this [`Socket`].
