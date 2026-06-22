@@ -388,6 +388,9 @@ impl RemoteStateActor {
             RemoteStateMessage::NetworkChange { is_major } => {
                 self.handle_msg_network_change(is_major);
             }
+            RemoteStateMessage::ResetPaths => {
+                self.handle_msg_reset_paths();
+            }
         }
     }
 
@@ -567,6 +570,21 @@ impl RemoteStateActor {
         if is_major {
             self.trigger_holepunching();
         }
+    }
+
+    /// Handles [`RemoteStateMessage::ResetPaths`].
+    ///
+    /// Clears the selected path so [`Self::trigger_address_lookup`] (which bails
+    /// while a path is selected) re-resolves the remote's CURRENT address, then
+    /// kicks address lookup + holepunching. This recovers a remote that restarted
+    /// or roamed to a new address without waiting for the stale path to age out.
+    /// Non-destructive to active connections: it only drops the path *selection*;
+    /// any live path re-selects itself on its next successful ping/holepunch.
+    fn handle_msg_reset_paths(&mut self) {
+        debug!(remote = %self.endpoint_id.fmt_short(), "reset paths: re-resolving + re-holepunching");
+        self.selected_path.set(None).ok();
+        self.trigger_address_lookup();
+        self.trigger_holepunching();
     }
 
     fn handle_connection_close(&mut self, conn_id: ConnId, reason: ConnectionError) {
@@ -1221,6 +1239,14 @@ pub(crate) enum RemoteStateMessage {
     RemoteInfo(oneshot::Sender<RemoteInfo>),
     /// The network status has changed in some way
     NetworkChange { is_major: bool },
+    /// Forget the currently-selected path and re-resolve + re-holepunch this remote.
+    ///
+    /// For a remote that has restarted or roamed to a NEW address: we may keep the
+    /// dead path it left behind selected, and `trigger_address_lookup` bails while a
+    /// path is selected — so the remote's current address is never re-resolved and
+    /// the connection stalls until the stale path ages out. Clearing the selection
+    /// lets re-resolution + holepunching pick up the fresh address immediately.
+    ResetPaths,
 }
 
 /// Information about a holepunch attempt.

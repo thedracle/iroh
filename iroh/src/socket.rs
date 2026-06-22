@@ -1217,6 +1217,16 @@ impl EndpointInner {
         rx.await.ok()
     }
 
+    /// Forget the selected path for `id` and re-resolve + re-holepunch it — recovers
+    /// a remote that restarted/roamed to a new address without waiting for the stale
+    /// path to age out. Fire-and-forget; no-op if no actor exists for the remote.
+    pub(crate) async fn reset_node(&self, id: EndpointId) {
+        self.actor_sender
+            .send(ActorMessage::ResetNode(id))
+            .await
+            .ok();
+    }
+
     /// Registers the connection in the `RemoteStateActor`.
     ///
     /// The actor is responsible for holepunching and opening additional paths to this
@@ -1263,6 +1273,8 @@ enum ActorMessage {
     ),
     #[debug("RemoteInfo(..)")]
     RemoteInfo(EndpointId, oneshot::Sender<RemoteInfo>),
+    /// Forget the selected path for a remote and re-resolve + re-holepunch it.
+    ResetNode(EndpointId),
     #[cfg(test)]
     ForceNetworkChange(bool),
 }
@@ -1470,6 +1482,9 @@ impl Actor {
                 if let Some(info) = self.remote_map.remote_info(id).await {
                     tx.send(info).ok();
                 }
+            }
+            ActorMessage::ResetNode(id) => {
+                self.remote_map.reset_node(id);
             }
             ActorMessage::AddConnection(remote, conn, tx) => {
                 if let Some(watcher) = self.remote_map.add_connection(remote, conn).await {

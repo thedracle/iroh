@@ -251,6 +251,15 @@ impl RemoteMap {
         rx.await.ok()
     }
 
+    /// Forget the selected path for `id` and re-resolve + re-holepunch it. No-op if
+    /// no actor exists for the remote. Fire-and-forget. See
+    /// [`RemoteStateMessage::ResetPaths`].
+    pub(super) fn reset_node(&self, id: EndpointId) {
+        if let Some(sender) = self.remote_state_actor_if_exists(id) {
+            sender.try_send(RemoteStateMessage::ResetPaths).ok();
+        }
+    }
+
     pub(super) async fn add_connection(
         &mut self,
         remote: EndpointId,

@@ -1482,6 +1482,24 @@ impl Endpoint {
         self.inner.network_change().await;
     }
 
+    /// Forget the currently-selected path to `endpoint_id` and re-resolve +
+    /// re-holepunch it.
+    ///
+    /// Use this when a remote is known to have **restarted or roamed to a new
+    /// address** (e.g. an application-level liveness check failed) but iroh may
+    /// still have the old, now-dead path selected. While a path is selected iroh
+    /// does not re-resolve the remote's address, so without this nudge the
+    /// connection can stall until the stale path ages out. Clearing the selection
+    /// makes iroh re-resolve the remote's current address and holepunch to it
+    /// immediately. Non-destructive: a still-live path re-selects itself; no-op if
+    /// no state is held for the remote or the endpoint is closed.
+    pub async fn reset_node(&self, endpoint_id: EndpointId) {
+        if self.is_closed() {
+            return;
+        }
+        self.inner.reset_node(endpoint_id).await;
+    }
+
     // # Methods to update internal state.
 
     /// Sets the initial user-defined data to be published in Address Lookups for this endpoint.
