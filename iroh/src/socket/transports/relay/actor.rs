@@ -229,10 +229,6 @@ enum RunError {
     SendTimeout,
     #[error("Ping timeout")]
     PingTimeout,
-    #[error("Local IP no longer valid")]
-    LocalIpInvalid,
-    #[error("No local address")]
-    LocalAddrMissing,
     #[error("Stream closed by server.")]
     StreamClosedServer,
     #[error("Client stream read failed")]
@@ -341,9 +337,15 @@ impl ActiveRelayActor {
                     break;
                 }
             } else {
-                // If the relay connection remained established long enough so that we received a pong
-                // from the relay server, we reset the backoff and attempt to reconnect immediately.
+                // If the relay connection remained established long enough so that we received a
+                // pong from the relay server, we reset the backoff. We still wait briefly before
+                // reconnecting: the server evicts the previous connection for a node when a new
+                // one arrives, so reconnecting instantly after a drop can knock out a connection
+                // that is still closing and start the whole cycle again.
                 backoff = Self::build_backoff();
+                if !self.sleep_backoff(RECONNECT_DELAY_AFTER_ESTABLISHED).await {
+                    break;
+                }
             }
         }
         debug!("exiting");
@@ -632,15 +634,25 @@ impl ActiveRelayActor {
                             }
                         }
                         ActiveRelayMessage::CheckConnection { local_ips } => {
+                            // Ping regardless of whether our local address still appears in
+                            // the interface list. On macOS an address can briefly vanish from
+                            // that list during a network transition while the socket keeps
+                            // working, so treating "not in the list" as "dead" tears down
+                            // healthy connections. The 5s ping timeout is the actual liveness
+                            // check, and it catches connections that really are gone.
                             match client_stream.local_addr() {
-                                Some(addr) if local_ips.contains(&addr.ip()) => {
-                                    let data = state.ping_tracker.new_ping();
-                                    let fut = client_sink.send(ClientToRelayMsg::Ping(data));
-                                    self.run_sending(fut, &mut state, &mut client_stream).await?;
+                                Some(addr) if !local_ips.contains(&addr.ip()) => {
+                                    debug!(
+                                        local_ip = %addr.ip(),
+                                        "local address not in interface list, pinging to check"
+                                    );
                                 }
-                                Some(_) => break Err(e!(RunError::LocalIpInvalid)),
-                                None => break Err(e!(RunError::LocalAddrMissing)),
+                                None => debug!("no local address for relay connection, pinging to check"),
+                                _ => {}
                             }
+                            let data = state.ping_tracker.new_ping();
+                            let fut = client_sink.send(ClientToRelayMsg::Ping(data));
+                            self.run_sending(fut, &mut state, &mut client_stream).await?;
                         }
                         #[cfg(test)]
                         ActiveRelayMessage::GetLocalAddr(sender) => {
@@ -912,6 +924,14 @@ pub(crate) struct RelaySendItem {
     pub(crate) datagrams: Datagrams,
 }
 
+/// How long to wait before reconnecting after an established connection drops.
+///
+/// See the reconnect handling in [`ActiveRelayActor::run`].
+const RECONNECT_DELAY_AFTER_ESTABLISHED: Duration = Duration::from_secs(2);
+
+/// Minimum interval between rebind-triggered connection checks.
+const REBIND_CHECK_MIN_INTERVAL: Duration = Duration::from_secs(5);
+
 pub(super) struct RelayActor {
     config: Config,
     /// Queue on which to put received datagrams.
@@ -924,6 +944,8 @@ pub(super) struct RelayActor {
     /// The tasks for the [`ActiveRelayActor`]s in `active_relays` above.
     active_relay_tasks: JoinSet<()>,
     cancel_token: CancellationToken,
+    /// When the last rebind-triggered connection check ran, used to rate-limit them.
+    last_rebind_check: Option<Instant>,
 }
 
 #[derive(Debug, Clone)]
@@ -1069,6 +1091,7 @@ impl RelayActor {
             active_relays: Default::default(),
             active_relay_tasks: JoinSet::new(),
             cancel_token,
+            last_rebind_check: None,
         }
     }
 
@@ -1344,6 +1367,18 @@ impl RelayActor {
     /// that's not known to be currently a local IP address should be closed.  All the other
     /// relay connections are pinged.
     async fn maybe_close_relays_on_rebind(&mut self) {
+        // Rebind events can arrive in bursts (macOS emits several AF_ROUTE events for a
+        // single network transition). Each one otherwise pings every active relay, so
+        // without a floor between checks a burst turns into a lot of redundant work.
+        let now = Instant::now();
+        if self
+            .last_rebind_check
+            .is_some_and(|last| now.duration_since(last) < REBIND_CHECK_MIN_INTERVAL)
+        {
+            debug!("skipping rebind check, one ran recently");
+            return;
+        }
+        self.last_rebind_check = Some(now);
         self.send_check_connection().await;
         self.log_active_relay();
     }
@@ -1643,7 +1678,7 @@ mod tests {
 
     #[tokio::test]
     #[traced_test]
-    async fn test_active_relay_reconnect() -> Result {
+    async fn test_active_relay_connection_check_keeps_connection() -> Result {
         let (_relay_map, relay_url, _server) = test_utils::run_relay_server().await?;
         let (peer_endpoint, _echo_endpoint_task) = start_echo_endpoint(relay_url.clone());
 
@@ -1717,8 +1752,11 @@ mod tests {
         )
         .await?;
 
-        // Now ask to check the connection, this will reconnect without pinging because we
-        // do not supply any "valid" local IP addresses.
+        // Ask to check the connection with no "valid" local IP addresses. The actor pings
+        // rather than reconnecting: a local address missing from the interface list does not
+        // mean the socket is dead, and on macOS it routinely goes missing for a moment
+        // during a network transition. A connection that really is dead is caught by the
+        // ping timeout instead.
         info!("check connection");
         inbox_tx
             .send(ActiveRelayMessage::CheckConnection {
@@ -1743,13 +1781,17 @@ mod tests {
         cancel_token.cancel();
         task.await.std_context("wait for task to finish")?;
 
-        // The actor connected once at startup and once more after the connection check
-        // failed.
-        assert_eq!(metrics.relay_conns_success.get(), 2);
+        // Only the initial connection: the check pinged the existing one instead of
+        // replacing it, and the echo above shows it still works.
+        assert_eq!(
+            metrics.relay_conns_success.get(),
+            1,
+            "the connection check should ping, not reconnect"
+        );
         assert_eq!(
             metrics.relay_conns_closed.get(),
-            2,
-            "the connections are counted as closed once the actor stops"
+            1,
+            "the connection is counted as closed once the actor stops"
         );
 
         Ok(())
