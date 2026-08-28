@@ -509,10 +509,34 @@ impl Socket {
     /// If the direct addresses have changed from the previous set, they are published to
     /// the address lookup system.
     fn store_direct_addresses(&self, addrs: BTreeSet<DirectAddr>) {
+        let addrs = self.filter_direct_addrs(addrs);
         let updated = self.direct_addrs.update(addrs);
         if updated {
             self.publish_my_addr();
         }
+    }
+
+    /// Applies the endpoint's configured address filter to the direct-address set.
+    ///
+    /// The filter is already applied when publishing to address lookup services. The
+    /// direct-address set is the other way an address leaves the endpoint: it is sent to
+    /// peers in-band as NAT traversal candidates. Without this, an address the operator
+    /// filtered out still reaches peers and they try to hole-punch to it.
+    fn filter_direct_addrs(&self, addrs: BTreeSet<DirectAddr>) -> BTreeSet<DirectAddr> {
+        let transport: Vec<TransportAddr> =
+            addrs.iter().map(|da| TransportAddr::Ip(da.addr)).collect();
+        let kept = self.address_lookup.apply_filter(&transport);
+        if kept.len() == transport.len() {
+            return addrs;
+        }
+        let kept: BTreeSet<SocketAddr> = kept
+            .iter()
+            .filter_map(|ta| match ta {
+                TransportAddr::Ip(sa) => Some(*sa),
+                _ => None,
+            })
+            .collect();
+        addrs.into_iter().filter(|da| kept.contains(&da.addr)).collect()
     }
 
     /// Get a reference to the DNS resolver used in this [`Socket`].
