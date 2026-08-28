@@ -108,7 +108,7 @@ use std::{
     task::{Poll, ready},
 };
 
-use iroh_base::{EndpointAddr, EndpointId};
+use iroh_base::{EndpointAddr, EndpointId, TransportAddr};
 pub use iroh_dns::{ParseError, endpoint_info::AddrFilter};
 use n0_error::{AnyError, e, stack_error};
 use n0_future::{MergeBounded, Stream, boxed::BoxStream};
@@ -475,6 +475,25 @@ impl AddressLookupServices {
     /// filtering regardless of how many services are configured.
     pub fn set_addr_filter(&self, filter: AddrFilter) {
         *self.addr_filter.write().expect("poisoned") = Some(filter);
+    }
+
+    /// Applies the configured address filter to `addrs`, or returns them unchanged
+    /// if no filter is set.
+    ///
+    /// Publishing applies the filter itself. This is for the other place addresses
+    /// leave the endpoint: the direct-address set exchanged in-band as NAT traversal
+    /// candidates, which lives in the socket rather than here.
+    pub(crate) fn apply_filter<'a>(
+        &self,
+        addrs: &'a Vec<TransportAddr>,
+    ) -> Cow<'a, [TransportAddr]> {
+        match &*self.addr_filter.read().expect("poisoned") {
+            Some(filter) => match filter.apply(addrs) {
+                Cow::Borrowed(kept) => Cow::Borrowed(kept.as_slice()),
+                Cow::Owned(kept) => Cow::Owned(kept),
+            },
+            None => Cow::Borrowed(addrs.as_slice()),
+        }
     }
 
     /// Adds an [`AddressLookup`] service.
@@ -1178,6 +1197,31 @@ mod tests {
         assert!(
             !addrs.contains(&TransportAddr::Ip(ip_addr)),
             "IP address should have been filtered out"
+        );
+    }
+
+    #[test]
+    fn concurrent_address_lookup_apply_filter() {
+        use iroh_base::RelayUrl;
+
+        let lookup = AddressLookupServices::default();
+        let relay_url: RelayUrl = "https://relay.example.com".parse().unwrap();
+        let ip_addr: SocketAddr = "1.2.3.4:1234".parse().unwrap();
+        let addrs = vec![
+            TransportAddr::Relay(relay_url.clone()),
+            TransportAddr::Ip(ip_addr),
+        ];
+
+        // With no filter configured the set is returned unchanged.
+        assert_eq!(&*lookup.apply_filter(&addrs), addrs.as_slice());
+
+        // With one configured it is applied, the same as for publishing.
+        lookup.set_addr_filter(AddrFilter::relay_only());
+        let kept = lookup.apply_filter(&addrs);
+        assert_eq!(&*kept, &[TransportAddr::Relay(relay_url)]);
+        assert!(
+            !kept.contains(&TransportAddr::Ip(ip_addr)),
+            "the IP address should have been filtered out"
         );
     }
 
